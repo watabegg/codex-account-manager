@@ -1,0 +1,805 @@
+#!/usr/bin/env python3
+"""Codex の複数アカウントを CODEX_HOME 単位で安全に管理する。"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import re
+import shlex
+import stat
+import subprocess
+import sys
+import tempfile
+import tomllib
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+DEFAULT_CONFIG = Path.home() / ".config" / "codex-accounts" / "config.toml"
+ACCOUNT_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+SHARED_ITEMS = (
+    "config.toml",
+    "AGENTS.md",
+    "agents",
+    "plugins",
+    "rules",
+    "skills",
+    "browser.config.toml",
+    "hooks.json",
+    "review.config.toml",
+)
+
+
+class ConfigError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class Account:
+    name: str
+    label: str
+    home: Path
+
+
+@dataclass(frozen=True)
+class Config:
+    path: Path
+    default_account: str
+    announce: bool
+    codex_binary: Path
+    shared_home: Path
+    accounts: dict[str, Account]
+    paths: dict[Path, str]
+
+
+def expand_path(value: str) -> Path:
+    return Path(os.path.expandvars(os.path.expanduser(value))).resolve(strict=False)
+
+
+def toml_string(value: str) -> str:
+    """TOMLのbasic stringとして安全な表現を返す。"""
+    return json.dumps(value, ensure_ascii=False)
+
+
+def load_config() -> Config:
+    config_path = expand_path(os.environ.get("CODEX_ACCOUNTS_CONFIG", str(DEFAULT_CONFIG)))
+    try:
+        with config_path.open("rb") as handle:
+            raw = tomllib.load(handle)
+    except FileNotFoundError as exc:
+        raise ConfigError(f"設定ファイルがありません: {config_path}") from exc
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(f"設定ファイルのTOMLが不正です: {exc}") from exc
+
+    if raw.get("version") != 1:
+        raise ConfigError("config.toml の version は 1 にしてください")
+
+    account_rows = raw.get("accounts")
+    if not isinstance(account_rows, dict) or not account_rows:
+        raise ConfigError("[accounts.<name>] を1つ以上定義してください")
+
+    accounts: dict[str, Account] = {}
+    for name, row in account_rows.items():
+        if not isinstance(row, dict) or not isinstance(row.get("home"), str):
+            raise ConfigError(f"accounts.{name}.home がありません")
+        accounts[name] = Account(
+            name=name,
+            label=str(row.get("label", name)),
+            home=expand_path(row["home"]),
+        )
+
+    default_account = raw.get("default_account")
+    if default_account not in accounts:
+        raise ConfigError(f"default_account が未定義です: {default_account!r}")
+
+    path_rows = raw.get("paths", {})
+    if not isinstance(path_rows, dict):
+        raise ConfigError("[paths] はパス = アカウント名の形式にしてください")
+    paths: dict[Path, str] = {}
+    for path_value, account_name in path_rows.items():
+        if account_name not in accounts:
+            raise ConfigError(f"paths.{path_value} のアカウントが未定義です: {account_name}")
+        paths[expand_path(path_value)] = account_name
+
+    binary_value = os.environ.get("CODEX_ACCOUNT_REAL_CODEX", raw.get("codex_binary"))
+    if not isinstance(binary_value, str):
+        raise ConfigError("codex_binary を指定してください")
+
+    shared_value = raw.get("shared_home", str(Path.home() / ".codex"))
+    if not isinstance(shared_value, str):
+        raise ConfigError("shared_home はパス文字列にしてください")
+
+    return Config(
+        path=config_path,
+        default_account=default_account,
+        announce=bool(raw.get("announce", True)),
+        codex_binary=expand_path(binary_value),
+        shared_home=expand_path(shared_value),
+        accounts=accounts,
+        paths=paths,
+    )
+
+
+def write_config_atomic(config: Config, content: str) -> None:
+    config.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".config.toml.",
+        dir=config.path.parent,
+        text=True,
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary_path.chmod(0o600)
+        os.replace(temporary_path, config.path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def validate_account_name(name: str) -> None:
+    if not ACCOUNT_NAME_PATTERN.fullmatch(name):
+        raise ConfigError(
+            "アカウント名は英数字で始まる64文字以内の英数字・ハイフン・"
+            "アンダースコアにしてください"
+        )
+
+
+def link_shared_items(config: Config, account: Account) -> None:
+    if account.home == config.shared_home:
+        return
+    for item in SHARED_ITEMS:
+        source = config.shared_home / item
+        destination = account.home / item
+        if not source.exists() or destination.exists() or destination.is_symlink():
+            continue
+        destination.symlink_to(source, target_is_directory=source.is_dir())
+
+
+def create_account(
+    config: Config,
+    name: str,
+    label: str | None = None,
+    home_value: str | None = None,
+) -> tuple[Config, Account]:
+    validate_account_name(name)
+    if name in config.accounts:
+        raise ConfigError(f"すでに定義済みのアカウントです: {name}")
+
+    home = expand_path(home_value) if home_value else config.shared_home / f"auth-{name}"
+    if any(existing.home == home for existing in config.accounts.values()):
+        raise ConfigError(f"別アカウントが同じCODEX_HOMEを使用しています: {home}")
+
+    block = (
+        f"\n\n[accounts.{toml_string(name)}]\n"
+        f"label = {toml_string(label or name)}\n"
+        f"home = {toml_string(str(home))}\n"
+    )
+    current_text = config.path.read_text(encoding="utf-8")
+    write_config_atomic(config, current_text.rstrip() + block)
+    updated = load_config()
+    account = updated.accounts[name]
+    ensure_account_home(account)
+    link_shared_items(updated, account)
+    return updated, account
+
+
+def add_path_mapping(config: Config, account: Account, path_value: str) -> Config:
+    root = expand_path(path_value)
+    if root in config.paths:
+        selected = config.paths[root]
+        if selected == account.name:
+            return config
+        raise ConfigError(f"このパスは {selected} に割当済みです: {root}")
+
+    text = config.path.read_text(encoding="utf-8")
+    lines = text.splitlines(keepends=True)
+    section_start: int | None = None
+    section_end = len(lines)
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped == "[paths]":
+            section_start = index
+            continue
+        if section_start is not None and index > section_start and stripped.startswith("["):
+            section_end = index
+            break
+
+    mapping_line = f"{toml_string(str(root))} = {toml_string(account.name)}\n"
+    if section_start is None:
+        updated_text = text.rstrip() + "\n\n[paths]\n" + mapping_line
+    else:
+        lines.insert(section_end, mapping_line)
+        updated_text = "".join(lines)
+    write_config_atomic(config, updated_text)
+    return load_config()
+
+
+def target_directory(args: list[str]) -> Path:
+    """Codex の -C/--cd を考慮した選択対象ディレクトリを返す。"""
+    directory: str | None = None
+    index = 0
+    while index < len(args):
+        value = args[index]
+        if value == "--":
+            break
+        if value in {"-C", "--cd"} and index + 1 < len(args):
+            directory = args[index + 1]
+            index += 2
+            continue
+        if value.startswith("--cd="):
+            directory = value.split("=", 1)[1]
+        index += 1
+    return expand_path(directory) if directory else Path.cwd().resolve(strict=False)
+
+
+def is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def select_account(
+    config: Config,
+    path: Path,
+    explicit: str | None = None,
+) -> tuple[Account, Path | None]:
+    requested = explicit or os.environ.get("CODEX_ACCOUNT")
+    if requested:
+        try:
+            return config.accounts[requested], None
+        except KeyError as exc:
+            raise ConfigError(f"未定義のアカウントです: {requested}") from exc
+
+    matches = [root for root in config.paths if is_within(path, root)]
+    if matches:
+        matched_root = max(matches, key=lambda item: len(item.parts))
+        return config.accounts[config.paths[matched_root]], matched_root
+    return config.accounts[config.default_account], None
+
+
+def get_account(config: Config, name: str | None, path: Path | None = None) -> Account:
+    if name:
+        try:
+            return config.accounts[name]
+        except KeyError as exc:
+            raise ConfigError(f"未定義のアカウントです: {name}") from exc
+    return select_account(config, path or Path.cwd().resolve(strict=False))[0]
+
+
+def decode_jwt_payload(token: object) -> dict[str, Any]:
+    if not isinstance(token, str):
+        return {}
+    parts = token.split(".")
+    if len(parts) < 2:
+        return {}
+    try:
+        padding = "=" * (-len(parts[1]) % 4)
+        decoded = base64.urlsafe_b64decode(parts[1] + padding)
+        payload = json.loads(decoded)
+        return payload if isinstance(payload, dict) else {}
+    except (ValueError, json.JSONDecodeError):
+        return {}
+
+
+def parse_time(value: object) -> datetime | None:
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value, timezone.utc)
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def iso_local(value: datetime | None) -> str:
+    if value is None:
+        return "不明"
+    return value.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def human_delta(seconds: float) -> str:
+    seconds = abs(seconds)
+    if seconds < 120:
+        return f"{int(seconds)}秒"
+    if seconds < 7200:
+        return f"{int(seconds // 60)}分"
+    if seconds < 172800:
+        return f"{int(seconds // 3600)}時間"
+    return f"{int(seconds // 86400)}日"
+
+
+def inspect_auth(account: Account) -> dict[str, Any]:
+    auth_path = account.home / "auth.json"
+    invalid_marker = account.home / ".codex-account-refresh-invalid"
+    result: dict[str, Any] = {
+        "account": account.name,
+        "label": account.label,
+        "home": str(account.home),
+        "auth_file": str(auth_path),
+        "auth_file_exists": auth_path.is_file(),
+        "auth_mode": None,
+        "last_refresh": None,
+        "access_expires": None,
+        "access_expired": None,
+        "id_expires": None,
+        "refresh_token_present": False,
+        "refresh_invalid_at": None,
+        "secure_permissions": None,
+        "error": None,
+    }
+    if not auth_path.is_file():
+        return result
+
+    if invalid_marker.is_file():
+        try:
+            result["refresh_invalid_at"] = invalid_marker.read_text(encoding="utf-8").strip()
+        except OSError:
+            result["refresh_invalid_at"] = "unknown"
+
+    try:
+        raw = json.loads(auth_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        result["error"] = str(exc)
+        return result
+
+    if not isinstance(raw, dict):
+        result["error"] = "auth.json のトップレベルがオブジェクトではありません"
+        return result
+
+    tokens = raw.get("tokens") if isinstance(raw.get("tokens"), dict) else {}
+    access_payload = decode_jwt_payload(tokens.get("access_token"))
+    id_payload = decode_jwt_payload(tokens.get("id_token"))
+    access_expiry = parse_time(access_payload.get("exp"))
+    id_expiry = parse_time(id_payload.get("exp"))
+    last_refresh = parse_time(raw.get("last_refresh"))
+
+    result.update(
+        {
+            "auth_mode": raw.get("auth_mode"),
+            "last_refresh": last_refresh.isoformat() if last_refresh else None,
+            "access_expires": access_expiry.isoformat() if access_expiry else None,
+            "access_expired": (
+                datetime.now(timezone.utc) >= access_expiry if access_expiry else None
+            ),
+            "id_expires": id_expiry.isoformat() if id_expiry else None,
+            "refresh_token_present": bool(tokens.get("refresh_token")),
+            "secure_permissions": stat.S_IMODE(auth_path.stat().st_mode) == 0o600,
+        }
+    )
+    return result
+
+
+def print_auth_status(account: Account, as_json: bool = False) -> int:
+    info = inspect_auth(account)
+    if as_json:
+        print(json.dumps(info, ensure_ascii=False, indent=2))
+        return 0 if info["auth_file_exists"] and not info["error"] else 1
+
+    print(f"{account.name} — {account.label}")
+    print(f"  CODEX_HOME: {account.home}")
+    if not info["auth_file_exists"]:
+        print("  認証: 未ログイン（auth.jsonなし）")
+        return 1
+    if info["error"]:
+        print(f"  認証: 読み取りエラー: {info['error']}")
+        return 1
+
+    print(f"  認証方式: {info['auth_mode'] or '不明'} / file")
+    last_refresh = parse_time(info["last_refresh"])
+    access_expiry = parse_time(info["access_expires"])
+    print(f"  最終更新: {iso_local(last_refresh)}")
+    if access_expiry:
+        remaining = (access_expiry - datetime.now(timezone.utc)).total_seconds()
+        if remaining <= 0:
+            print(f"  access token: 期限切れ（{human_delta(remaining)}前）")
+        else:
+            print(f"  access token: 有効（残り{human_delta(remaining)}）")
+    else:
+        print("  access token: 有効期限を判定できません")
+    print(
+        "  refresh token: "
+        + ("あり（有効性は実通信でのみ判定可能）" if info["refresh_token_present"] else "なし")
+    )
+    if info["refresh_invalid_at"]:
+        print(f"  refresh検証: 失効確認済み（{info['refresh_invalid_at']}）")
+    if info["secure_permissions"] is False:
+        print("  警告: auth.json の権限が 0600 ではありません")
+    return 0
+
+
+def print_launch_auth_warning(account: Account) -> None:
+    info = inspect_auth(account)
+    if not info["auth_file_exists"]:
+        print(
+            f"[codex-account] 警告: {account.name} は未ログインです。"
+            f"`codex-account login {account.name}` を実行してください",
+            file=sys.stderr,
+        )
+        return
+    if info["error"]:
+        print(
+            f"[codex-account] 警告: {account.name} のauth.jsonを読めません: {info['error']}",
+            file=sys.stderr,
+        )
+        return
+    if info["access_expired"] is True:
+        if info["refresh_invalid_at"]:
+            detail = "refresh tokenも失効確認済みのため再ログインが必要です"
+        elif info["refresh_token_present"]:
+            detail = "Codexがrefreshを試みます"
+        else:
+            detail = "refresh tokenもないため再ログインが必要です"
+        print(
+            f"[codex-account] 注意: {account.name} のaccess tokenは期限切れです。{detail}",
+            file=sys.stderr,
+        )
+        print(
+            f"[codex-account] 失敗時: codex-account login {account.name}",
+            file=sys.stderr,
+        )
+
+
+def codex_argv(config: Config, args: list[str]) -> list[str]:
+    if not config.codex_binary.is_file() or not os.access(config.codex_binary, os.X_OK):
+        raise ConfigError(f"Codex実体が見つからないか実行できません: {config.codex_binary}")
+    return [
+        str(config.codex_binary),
+        "-c",
+        'cli_auth_credentials_store="file"',
+        *args,
+    ]
+
+
+def account_env(account: Account) -> dict[str, str]:
+    env = os.environ.copy()
+    env["CODEX_HOME"] = str(account.home)
+    env["CODEX_ACCOUNT"] = account.name
+    return env
+
+
+def ensure_account_home(account: Account) -> None:
+    account.home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        account.home.chmod(0o700)
+    except OSError:
+        pass
+    auth_path = account.home / "auth.json"
+    if auth_path.is_file():
+        auth_path.chmod(0o600)
+
+
+def refresh_invalid_marker(account: Account) -> Path:
+    return account.home / ".codex-account-refresh-invalid"
+
+
+def mark_refresh_invalid(account: Account) -> None:
+    marker = refresh_invalid_marker(account)
+    marker.write_text(datetime.now(timezone.utc).isoformat() + "\n", encoding="utf-8")
+    marker.chmod(0o600)
+
+
+def clear_refresh_invalid(account: Account) -> None:
+    refresh_invalid_marker(account).unlink(missing_ok=True)
+
+
+def exec_codex(config: Config, account: Account, args: list[str], announce: bool = True) -> None:
+    ensure_account_home(account)
+    if announce and config.announce:
+        print(
+            f"[codex-account] {account.name} — {account.label} ({account.home})",
+            file=sys.stderr,
+        )
+    print_launch_auth_warning(account)
+    argv = codex_argv(config, args)
+    os.execvpe(argv[0], argv, account_env(account))
+
+
+def command_run(config: Config, namespace: argparse.Namespace) -> None:
+    forwarded = list(namespace.codex_args)
+    if forwarded and forwarded[0] == "--":
+        forwarded.pop(0)
+    path = target_directory(forwarded)
+    account, matched_root = select_account(config, path, namespace.account)
+    if config.announce and matched_root:
+        print(f"[codex-account] path rule: {matched_root}", file=sys.stderr)
+    exec_codex(config, account, forwarded)
+
+
+def command_which(config: Config, namespace: argparse.Namespace) -> int:
+    path = expand_path(namespace.path) if namespace.path else Path.cwd().resolve(strict=False)
+    account, matched_root = select_account(config, path, namespace.account)
+    print(account.name)
+    print(f"  label: {account.label}")
+    print(f"  path: {path}")
+    print(f"  rule: {matched_root if matched_root else '(default)'}")
+    print(f"  CODEX_HOME: {account.home}")
+    return 0
+
+
+def command_list(config: Config) -> int:
+    for name in sorted(config.accounts):
+        account = config.accounts[name]
+        default = " [default]" if name == config.default_account else ""
+        print(f"{name}{default}\n  {account.label}\n  {account.home}")
+        roots = sorted(root for root, selected in config.paths.items() if selected == name)
+        for root in roots:
+            print(f"  path: {root}")
+    return 0
+
+
+def command_status(config: Config, namespace: argparse.Namespace) -> int:
+    if namespace.all:
+        accounts = [config.accounts[name] for name in sorted(config.accounts)]
+    else:
+        accounts = [get_account(config, namespace.account)]
+    results = [inspect_auth(account) for account in accounts]
+    if namespace.json:
+        output: object = results if namespace.all else results[0]
+        print(json.dumps(output, ensure_ascii=False, indent=2))
+    else:
+        for index, account in enumerate(accounts):
+            if index:
+                print()
+            print_auth_status(account)
+    return 0 if all(item["auth_file_exists"] and not item["error"] for item in results) else 1
+
+
+def command_prepare(config: Config) -> int:
+    for account in config.accounts.values():
+        ensure_account_home(account)
+        link_shared_items(config, account)
+        print(f"prepared: {account.name} -> {account.home}")
+    return 0
+
+
+def command_add(config: Config, namespace: argparse.Namespace) -> int:
+    config, account = create_account(config, namespace.account, namespace.label, namespace.home)
+    if namespace.path:
+        add_path_mapping(config, account, namespace.path)
+    print(f"追加しました: {account.name} -> {account.home}")
+    if namespace.path:
+        print(f"path rule: {expand_path(namespace.path)} -> {account.name}")
+    print(f"ログイン: codex-account login {account.name}")
+    return 0
+
+
+def command_map(config: Config, namespace: argparse.Namespace) -> int:
+    account = get_account(config, namespace.account)
+    add_path_mapping(config, account, namespace.path)
+    print(f"path rule: {expand_path(namespace.path)} -> {account.name}")
+    return 0
+
+
+def command_login(config: Config, namespace: argparse.Namespace) -> int:
+    if namespace.account and namespace.account not in config.accounts:
+        config, account = create_account(
+            config,
+            namespace.account,
+            namespace.label,
+            namespace.home,
+        )
+        print(f"新規アカウントを追加しました: {account.name} -> {account.home}")
+    else:
+        account = get_account(config, namespace.account)
+        if namespace.home or namespace.label:
+            raise ConfigError("--home/--label は新規アカウント作成時だけ指定できます")
+    if namespace.path:
+        config = add_path_mapping(config, account, namespace.path)
+        account = config.accounts[account.name]
+        print(f"path rule: {expand_path(namespace.path)} -> {account.name}")
+    ensure_account_home(account)
+    link_shared_items(config, account)
+    args = ["login"]
+    if namespace.device_auth:
+        args.append("--device-auth")
+    completed = subprocess.run(
+        codex_argv(config, args),
+        env=account_env(account),
+        check=False,
+    )
+    if completed.returncode == 0:
+        clear_refresh_invalid(account)
+        print()
+        print_auth_status(account)
+    return completed.returncode
+
+
+def command_logout(config: Config, namespace: argparse.Namespace) -> None:
+    account = get_account(config, namespace.account)
+    if not namespace.yes:
+        raise ConfigError(
+            f"{account.name} の認証削除には --yes が必要です: "
+            f"codex-account logout {shlex.quote(account.name)} --yes"
+        )
+    exec_codex(config, account, ["logout"])
+
+
+def command_doctor(config: Config, namespace: argparse.Namespace) -> int:
+    account = get_account(config, namespace.account)
+    print_auth_status(account)
+    print(
+        "\nCodex Doctor（認証ファイルの存在と通信経路を確認。"
+        "tokenの実利用検証ではありません）",
+        flush=True,
+    )
+    completed = subprocess.run(
+        codex_argv(config, ["doctor", "--summary", "--no-color"]),
+        env=account_env(account),
+        check=False,
+    )
+    return completed.returncode
+
+
+def command_probe(config: Config, namespace: argparse.Namespace) -> int:
+    account = get_account(config, namespace.account)
+    if not namespace.yes:
+        raise ConfigError(
+            "probe はモデル呼び出しを1回行います。実行する場合は --yes を付けてください"
+        )
+    ensure_account_home(account)
+    print(f"{account.name} で実通信を行い、自動refreshを検証します", file=sys.stderr)
+    completed = subprocess.run(
+        codex_argv(
+            config,
+            [
+                "--ask-for-approval",
+                "never",
+                "exec",
+                "--ephemeral",
+                "--skip-git-repo-check",
+                "--sandbox",
+                "read-only",
+                "Reply with exactly: OK",
+            ],
+        ),
+        cwd=Path.home(),
+        env=account_env(account),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    combined_output = "\n".join((completed.stdout, completed.stderr))
+    if completed.returncode == 0:
+        clear_refresh_invalid(account)
+        if completed.stdout.strip():
+            print(completed.stdout.strip())
+    elif "invalid_refresh_token" in combined_output:
+        mark_refresh_invalid(account)
+        print(
+            f"{account.name}: refresh tokenは失効しています。"
+            f"`codex-account login {account.name}` で再ログインしてください",
+            file=sys.stderr,
+        )
+    else:
+        diagnostic = combined_output.strip()
+        if len(diagnostic) > 4000:
+            diagnostic = diagnostic[-4000:]
+        if diagnostic:
+            print(diagnostic, file=sys.stderr)
+    print()
+    print_auth_status(account)
+    return completed.returncode
+
+
+def command_shell_init() -> int:
+    """bash/zshでcodexラッパーを確実に選ぶための関数定義を出力する。"""
+    wrapper = Path(__file__).resolve(strict=False).with_name("codex")
+    print(f"codex() {{ command {shlex.quote(str(wrapper))} \"$@\"; }}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="codex-account",
+        description="Codexのアカウント選択・期限確認・再ログインを管理します",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    run_parser = subparsers.add_parser("run", help="選択したアカウントでCodexを起動")
+    run_parser.add_argument("--account", choices=None)
+    run_parser.add_argument("codex_args", nargs=argparse.REMAINDER)
+
+    which_parser = subparsers.add_parser("which", help="ディレクトリに対応するアカウントを表示")
+    which_parser.add_argument("path", nargs="?")
+    which_parser.add_argument("--account")
+
+    subparsers.add_parser("list", help="アカウントとパス規則を一覧表示")
+
+    status_parser = subparsers.add_parser("status", help="tokenのローカル状態を安全に表示")
+    status_parser.add_argument("account", nargs="?")
+    status_parser.add_argument("--all", action="store_true")
+    status_parser.add_argument("--json", action="store_true")
+
+    subparsers.add_parser("prepare", help="アカウントホームと権限を準備")
+
+    add_parser = subparsers.add_parser("add", help="ログインせずアカウント定義を追加")
+    add_parser.add_argument("account")
+    add_parser.add_argument("--label")
+    add_parser.add_argument("--home")
+    add_parser.add_argument("--path")
+
+    map_parser = subparsers.add_parser("map", help="ディレクトリをアカウントへ割り当て")
+    map_parser.add_argument("account")
+    map_parser.add_argument("path")
+
+    login_parser = subparsers.add_parser(
+        "login",
+        help="指定アカウントをログイン（未定義名は自動追加）",
+    )
+    login_parser.add_argument("account", nargs="?")
+    login_parser.add_argument("--device-auth", action="store_true")
+    login_parser.add_argument("--label")
+    login_parser.add_argument("--home")
+    login_parser.add_argument("--path")
+
+    logout_parser = subparsers.add_parser("logout", help="指定アカウントの認証を削除")
+    logout_parser.add_argument("account", nargs="?")
+    logout_parser.add_argument("--yes", action="store_true")
+
+    doctor_parser = subparsers.add_parser("doctor", help="ローカル状態とCodex Doctorを実行")
+    doctor_parser.add_argument("account", nargs="?")
+
+    probe_parser = subparsers.add_parser("probe", help="実通信でrefresh tokenを検証（モデル利用あり）")
+    probe_parser.add_argument("account", nargs="?")
+    probe_parser.add_argument("--yes", action="store_true")
+
+    subparsers.add_parser(
+        "shell-init",
+        help="bash/zsh用のshell関数を出力（通常はevalと組み合わせて使用）",
+    )
+
+    return parser
+
+
+def main() -> int:
+    try:
+        namespace = build_parser().parse_args()
+        if namespace.command == "shell-init":
+            return command_shell_init()
+        config = load_config()
+        if namespace.command == "run":
+            command_run(config, namespace)
+            return 0
+        if namespace.command == "which":
+            return command_which(config, namespace)
+        if namespace.command == "list":
+            return command_list(config)
+        if namespace.command == "status":
+            return command_status(config, namespace)
+        if namespace.command == "prepare":
+            return command_prepare(config)
+        if namespace.command == "add":
+            return command_add(config, namespace)
+        if namespace.command == "map":
+            return command_map(config, namespace)
+        if namespace.command == "login":
+            return command_login(config, namespace)
+        if namespace.command == "logout":
+            command_logout(config, namespace)
+            return 0
+        if namespace.command == "doctor":
+            return command_doctor(config, namespace)
+        if namespace.command == "probe":
+            return command_probe(config, namespace)
+        raise ConfigError(f"未対応のコマンドです: {namespace.command}")
+    except ConfigError as exc:
+        print(f"codex-account: {exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("codex-account: 中断しました", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

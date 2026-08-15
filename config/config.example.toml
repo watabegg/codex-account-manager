@@ -1,0 +1,19 @@
+version = 1
+default_account = "default"
+announce = true
+codex_binary = "@CODEX_BINARY@"
+shared_home = "$HOME/.codex"
+
+[accounts.default]
+label = "Default"
+home = "$HOME/.codex"
+
+# 追加アカウントの例。`codex-account add work` でも追加できます。
+# [accounts.work]
+# label = "Work"
+# home = "$HOME/.codex/auth-work"
+
+# カレントディレクトリに応じてアカウントを自動選択します。
+# 最も長く一致するパスが優先されます。
+[paths]
+# "$HOME/src/work" = "work"
