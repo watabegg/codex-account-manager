@@ -10,6 +10,9 @@ fake_codex="${test_root}/real-codex"
 cat >"${fake_codex}" <<'EOF'
 #!/usr/bin/env bash
 printf 'CODEX_HOME=%s\n' "${CODEX_HOME-}"
+printf 'CODEX_ACCOUNT=%s\n' "${CODEX_ACCOUNT-}"
+printf 'CODEX_ACCOUNT_ACTIVE=%s\n' "${CODEX_ACCOUNT_ACTIVE-}"
+printf 'CODEX_COMMAND=%s\n' "$(command -v codex || true)"
 printf 'ARGS=%s\n' "$*"
 EOF
 chmod 0755 "${fake_codex}"
@@ -39,7 +42,24 @@ output="$({
     "${install_prefix}/bin/codex" --version
 } 2>/dev/null)"
 grep -F "CODEX_HOME=${test_home}/.codex" <<<"${output}" >/dev/null
+grep -Fx 'CODEX_ACCOUNT=' <<<"${output}" >/dev/null
+grep -F 'CODEX_ACCOUNT_ACTIVE=default' <<<"${output}" >/dev/null
+grep -F "CODEX_COMMAND=${install_prefix}/bin/codex" <<<"${output}" >/dev/null
 grep -F 'ARGS=-c cli_auth_credentials_store="file" --version' <<<"${output}" >/dev/null
+
+explicit_output="$({
+  CODEX_ACCOUNT=ignored HOME="${test_home}" CODEX_ACCOUNTS_CONFIG="${config_path}" \
+    "${install_prefix}/bin/codex" --account=default --version
+} 2>/dev/null)"
+grep -Fx 'CODEX_ACCOUNT=' <<<"${explicit_output}" >/dev/null
+grep -F 'CODEX_ACCOUNT_ACTIVE=default' <<<"${explicit_output}" >/dev/null
+grep -F 'ARGS=-c cli_auth_credentials_store="file" --version' <<<"${explicit_output}" >/dev/null
+
+shell_init_output="$(
+  HOME="${test_home}" CODEX_ACCOUNTS_CONFIG="${config_path}" \
+    "${install_prefix}/bin/codex-account" shell-init
+)"
+grep -F "${install_prefix}/bin/codex" <<<"${shell_init_output}" >/dev/null
 
 printf '\n# keep-me\n' >>"${config_path}"
 HOME="${test_home}" \

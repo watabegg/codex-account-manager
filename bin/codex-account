@@ -464,7 +464,19 @@ def codex_argv(config: Config, args: list[str]) -> list[str]:
 def account_env(account: Account) -> dict[str, str]:
     env = os.environ.copy()
     env["CODEX_HOME"] = str(account.home)
-    env["CODEX_ACCOUNT"] = account.name
+    # CODEX_ACCOUNT はルーターへの一回限りの明示指定として消費する。
+    # Codex本体へ持ち越すと、その配下で起動した別のCodexまで同じ
+    # アカウントに固定され、カレントディレクトリの規則が効かなくなる。
+    env.pop("CODEX_ACCOUNT", None)
+    env["CODEX_ACCOUNT_ACTIVE"] = account.name
+    # Codex配下のツールがさらに`codex`を起動するときも、このルーターを
+    # 必ず経由させる。CLI本体のインストール先がPATH上で先行すると、
+    # ツール側が設定したCODEX_HOMEをそのまま使って認証が混線するため。
+    router_dir = str(Path(__file__).resolve(strict=False).parent)
+    path_entries = env.get("PATH", "").split(os.pathsep)
+    env["PATH"] = os.pathsep.join(
+        [router_dir, *(entry for entry in path_entries if entry != router_dir)]
+    )
     return env
 
 

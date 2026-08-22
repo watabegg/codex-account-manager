@@ -86,6 +86,14 @@ CODEX_ACCOUNT=work codex
 
 `codex -C DIR`と`codex exec -C DIR`の`DIR`も選択対象になります。
 
+アカウント選択はCodexプロセスの起動時に行います。起動後に別ディレクトリへ移動しても、
+そのセッションの認証は切り替わりません。対象ディレクトリで起動するか、`-C DIR`または
+`--account NAME`を指定してください。
+
+ルーターから起動したCodexでは、子プロセスがさらに`codex`を起動した場合もルーターを
+経由します。レビューランチャーなどが独自に`CODEX_HOME`を設定しても、子Codexは
+カレントディレクトリまたは明示指定に基づいて改めてアカウントを選択します。
+
 ## 設定ファイル
 
 `~/.config/codex-accounts/config.toml`を直接編集しても構いません。
@@ -120,7 +128,8 @@ home = "$HOME/.codex/auth-client-a"
 
 環境変数でも一時的に変更できます。
 
-- `CODEX_ACCOUNT`: 起動するアカウント名
+- `CODEX_ACCOUNT`: 起動するアカウント名。この1回の選択で消費され、子プロセスへは引き継ぎません
+- `CODEX_ACCOUNT_ACTIVE`: ルーターが選択したアカウント名（読み取り用）
 - `CODEX_ACCOUNTS_CONFIG`: 設定ファイルの場所
 - `CODEX_ACCOUNT_REAL_CODEX`: Codex本体の場所
 

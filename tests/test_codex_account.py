@@ -13,6 +13,7 @@ import unittest
 from contextlib import redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "bin" / "codex-account"
@@ -32,6 +33,7 @@ def fake_jwt(payload: dict[str, object]) -> str:
 class CodexAccountTests(unittest.TestCase):
     def setUp(self) -> None:
         self.original_account = os.environ.pop("CODEX_ACCOUNT", None)
+        self.original_active_account = os.environ.pop("CODEX_ACCOUNT_ACTIVE", None)
         self.temp_dir = tempfile.TemporaryDirectory()
         root = Path(self.temp_dir.name)
         self.personal = module.Account("personal", "Personal", root / "personal")
@@ -48,8 +50,12 @@ class CodexAccountTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
+        os.environ.pop("CODEX_ACCOUNT", None)
+        os.environ.pop("CODEX_ACCOUNT_ACTIVE", None)
         if self.original_account is not None:
             os.environ["CODEX_ACCOUNT"] = self.original_account
+        if self.original_active_account is not None:
+            os.environ["CODEX_ACCOUNT_ACTIVE"] = self.original_active_account
 
     def test_longest_path_rule_wins(self) -> None:
         root = Path(self.temp_dir.name)
@@ -69,6 +75,31 @@ class CodexAccountTests(unittest.TestCase):
         root = Path(self.temp_dir.name)
         selected = module.target_directory(["exec", "-C", str(root / "projects"), "hello"])
         self.assertEqual(selected, (root / "projects").resolve(strict=False))
+
+    def test_environment_override_is_consumed_without_pinning_child_processes(self) -> None:
+        root = Path(self.temp_dir.name)
+        os.environ["CODEX_ACCOUNT"] = "work"
+
+        account, matched = module.select_account(self.config, root / "unmapped")
+        child_env = module.account_env(account)
+
+        self.assertEqual(account.name, "work")
+        self.assertIsNone(matched)
+        self.assertNotIn("CODEX_ACCOUNT", child_env)
+        self.assertEqual(child_env["CODEX_ACCOUNT_ACTIVE"], "work")
+        self.assertEqual(child_env["CODEX_HOME"], str(self.work.home))
+
+    def test_account_env_prioritizes_router_for_nested_codex(self) -> None:
+        router_dir = str(SCRIPT.resolve(strict=False).parent)
+        original_path = os.pathsep.join(("/usr/bin", router_dir, "/bin"))
+
+        with patch.dict(os.environ, {"PATH": original_path}):
+            child_env = module.account_env(self.work)
+
+        path_entries = child_env["PATH"].split(os.pathsep)
+        self.assertEqual(path_entries[0], router_dir)
+        self.assertEqual(path_entries.count(router_dir), 1)
+        self.assertEqual(path_entries[1:], ["/usr/bin", "/bin"])
 
     def test_auth_inspection_never_returns_token_values(self) -> None:
         self.work.home.mkdir(parents=True)
